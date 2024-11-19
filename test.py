@@ -3,22 +3,26 @@ import cv2
 import numpy as np
 import pandas as pd
 from PIL import Image
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from pyzbar.pyzbar import decode
 from ultralytics import YOLO
 import torch
+import logging
+import matplotlib.pyplot as plt
+import numpy as np
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+from sklearn.metrics import precision_recall_curve, average_precision_score
+from sklearn.metrics import precision_recall_fscore_support
 
-# Initialize the models
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 barcode_model = YOLO('barcode.pt')
 
-# Define paths
-images_folder = r"path/to/your/original_dataset/images"  # Update with actual path
-annotation_file = r"path/to/your/original_dataset/annotations.tsv"  # Update with actual path
+images_folder = r"data\test_dataset\goods-barcodes\images"
+annotation_file = r"data\test_dataset\goods-barcodes\annotation.tsv"
 output_folder = "output_barcode_results"
 os.makedirs(output_folder, exist_ok=True)
 
-# Helper function to decode barcodes with ZBar
 def decode_barcodes(image_np):
     """Decode barcodes using Pyzbar."""
     barcodes = decode(image_np)
@@ -34,104 +38,136 @@ def decode_barcodes(image_np):
         })
     return decoded_info
 
-# Process a single image with YOLO and ZBar
-def process_image(image_path, ground_truth_barcode, save_folder=None):
-    """Process a single image using YOLO and Pyzbar, and save the result."""
+def process_image(image_path, save_folder=None):
+    """Process a single image using YOLO and Pyzbar, save result, and return detections."""
     image = Image.open(image_path)
     image_np = np.array(image)
 
-    # Perform YOLO-based barcode detection
-    yolo_results = barcode_model(image_np)
+    # Step 1: Decode full image with Pyzbar
+    full_image_barcodes = decode_barcodes(image_np)
 
+    # Step 2: Perform YOLO-based barcode detection
+    barcode_results = barcode_model(image_np)
     detected_barcodes = []
-    yolo_correct = False  # Flag to track if YOLO detected the correct region
 
-    # Process YOLO detections
-    for result in yolo_results:
+    # Step 3: Process YOLO detections
+    for result in barcode_results:
         boxes = result.boxes
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             cropped_region = image_np[y1:y2, x1:x2]
 
-            # Decode barcodes within the detected area using ZBar
-            barcodes = decode_barcodes(cropped_region)
-            for barcode in barcodes:
+            # Decode barcodes within the YOLO-detected area
+            yolo_barcodes = decode_barcodes(cropped_region)
+            for barcode in yolo_barcodes:
                 detected_barcodes.append(barcode["data"])
-
-                # Check if the decoded barcode matches the ground truth
-                if barcode["data"] == ground_truth_barcode:
-                    yolo_correct = True  # Mark YOLO as successful for this region
-
-                # Annotate the detected barcode
+                # Draw bounding boxes and annotations
                 cv2.putText(image_np, f"{barcode['data']} ({barcode['type']})",
                             (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
             cv2.rectangle(image_np, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-    # Save the processed image with annotations (optional)
+    # Step 4: Combine detections from YOLO and full-image Pyzbar scan
+    all_detected_barcodes = {barcode["data"] for barcode in full_image_barcodes}
+    all_detected_barcodes.update(detected_barcodes)  # Include YOLO-based detections
+
+    # Save the processed image if save_folder is provided
     if save_folder:
         output_path = os.path.join(save_folder, os.path.basename(image_path))
         cv2.imwrite(output_path, image_np)
 
-    return detected_barcodes, yolo_correct
+    return list(all_detected_barcodes)
 
-def evaluate_barcode_detection(images_folder, annotation_file, output_folder):
-    """Evaluate the YOLO + Pyzbar barcode model on the original dataset with TSV annotations."""
+def plot_f1_vs_threshold(y_true, y_scores):
+    """Plot F1 Score vs. Threshold."""
+    precision, recall, thresholds = precision_recall_curve(y_true, y_scores)
+    f1_scores = 2 * (precision * recall) / (precision + recall + 1e-6)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(thresholds, f1_scores[:-1], marker='.', label='F1 Score')
+    plt.xlabel('Threshold')
+    plt.ylabel('F1 Score')
+    plt.title('F1 Score vs. Threshold')
+    plt.legend()
+    plt.grid()
+    plt.show()
+
+from sklearn.metrics import roc_curve, auc
+
+def plot_roc_curve(y_true, y_scores):
+    """Plot ROC Curve."""
+    fpr, tpr, _ = roc_curve(y_true, y_scores)
+    roc_auc = auc(fpr, tpr)
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(fpr, tpr, color='blue', lw=2, label=f'AUC = {roc_auc:.2f}')
+    plt.plot([0, 1], [0, 1], color='gray', linestyle='--')
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('ROC Curve')
+    plt.legend(loc='lower right')
+    plt.grid()
+    plt.show()
+
+def evaluate_and_visualize(images_folder, annotation_file, output_folder):
+    """Evaluate barcode detection with explicit negatives, and visualize confusion matrix + ROC."""
     annotations_df = pd.read_csv(annotation_file, sep='\t')
 
-    # Check if 'code' column exists in TSV
     if 'code' not in annotations_df.columns:
-        print("Error: 'code' column not found in the annotation file.")
+        logging.error("Error: 'code' column not found in the annotation file.")
         return
 
-    all_barcodes_pred = []
-    all_barcodes_true = []
-    yolo_correct_count = 0
-    total_images = 0
+    y_true = []  # Ground truth (1 for positive, 0 for negative)
+    y_pred = []  # Predictions (1 for detected, 0 for not detected)
 
     for idx, row in annotations_df.iterrows():
         image_path = os.path.join(images_folder, row['filename'])
         if not os.path.exists(image_path):
-            print(f"Image {row['filename']} not found.")
+            logging.warning(f"Image {row['filename']} not found.")
             continue
 
-        # Load ground truth barcode from the TSV file
-        ground_truth_barcode = str(row['code'])
-        all_barcodes_true.append(ground_truth_barcode)
+        # Ground truth and predictions
+        detected_barcodes = set(process_image(image_path, save_folder=output_folder))
+        true_barcodes = set(str(row['code']).split(',')) if pd.notna(row['code']) else set()
 
-        # Process the image and get detected barcodes and YOLO success flag
-        detected_barcodes, yolo_correct = process_image(image_path, ground_truth_barcode, save_folder=output_folder)
-        
-        # Count YOLO success if it detected the correct barcode region
-        if yolo_correct:
-            yolo_correct_count += 1
+        # Handle True Positives and False Negatives
+        for barcode in true_barcodes:
+            y_true.append(1)  # Ground truth: barcode present
+            y_pred.append(1 if barcode in detected_barcodes else 0)  # Prediction: detected or not
 
-        # Use the first detected barcode as the predicted result (if available)
-        all_barcodes_pred.append(detected_barcodes[0] if detected_barcodes else None)
-        total_images += 1
+        # Handle False Positives
+        for barcode in detected_barcodes:
+            if barcode not in true_barcodes:
+                y_true.append(0)  # Ground truth: no barcode
+                y_pred.append(1)  # Prediction: detected
 
-    # Filter out pairs where either prediction or ground truth is None
-    filtered_true = []
-    filtered_pred = []
+        # Handle True Negatives
+        if not true_barcodes and not detected_barcodes:
+            y_true.append(0)  # Ground truth: no barcode
+            y_pred.append(0)  # Prediction: no barcode
 
-    for true, pred in zip(all_barcodes_true, all_barcodes_pred):
-        if true is not None and pred is not None:
-            filtered_true.append(true)
-            filtered_pred.append(pred)
+    # Calculate confusion matrix
+    cm = confusion_matrix(y_true, y_pred)
 
-    # Check if there's any valid data to evaluate
-    if len(filtered_true) == 0 or len(filtered_pred) == 0:
-        print("No valid barcode detections found for evaluation.")
-        return
+    # Display confusion matrix
+    disp = ConfusionMatrixDisplay(
+        confusion_matrix=cm,
+        display_labels=["Negative", "Positive"]
+    )
+    disp.plot(cmap='Blues')
+    plt.title("Confusion Matrix for Barcode Detection")
+    plt.show()
 
-    # Calculate and print evaluation metrics for the YOLO+ZBar pipeline
-    print("\n--- Barcode Detection Evaluation ---")
-    print(f"YOLO Correct Region Detection Rate: {yolo_correct_count / total_images:.2f}")
-    print(f"Accuracy: {accuracy_score(filtered_true, filtered_pred):.2f}")
-    print(f"Precision: {precision_score(filtered_true, filtered_pred, average='weighted', zero_division=0):.2f}")
-    print(f"Recall: {recall_score(filtered_true, filtered_pred, average='weighted', zero_division=0):.2f}")
-    print(f"F1 Score: {f1_score(filtered_true, filtered_pred, average='weighted', zero_division=0):.2f}")
-    print("\nEvaluation completed.")
+    # Calculate evaluation metrics
+    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='binary')
+
+    plot_f1_vs_threshold(y_true, y_pred)
+    plot_roc_curve(y_true, y_pred)
+    # Display results
+    print(f"Precision: {precision:.2f}")
+    print(f"Recall: {recall:.2f}")
+    print(f"F1 Score: {f1:.2f}")
+
+
 
 if __name__ == "__main__":
-    evaluate_barcode_detection(images_folder, annotation_file, output_folder)
-
+    evaluate_and_visualize(images_folder, annotation_file, output_folder)
