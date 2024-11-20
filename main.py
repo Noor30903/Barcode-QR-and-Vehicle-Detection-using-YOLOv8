@@ -38,8 +38,16 @@ def decode_barcodes(image_np):
     return decoded_info
 
 # Function to process a single uploaded image
+# Function to process a single uploaded image
 def process_image(uploaded_image):
     image = Image.open(uploaded_image)
+
+    # Convert the image to RGB if it has an alpha channel
+    if image.mode == 'RGBA':
+        image = image.convert('RGB')
+    elif image.mode == 'L':  # For grayscale images
+        image = image.convert('RGB')
+
     image_np = np.array(image)
 
     # Perform OCR on the uploaded image
@@ -74,7 +82,8 @@ def process_image(uploaded_image):
                 barcode_type = barcode["type"]
                 barcode_info.append(f"{barcode_data} ({barcode_type})")
                 cv2.putText(image_np, f"{barcode_data} ({barcode_type})",
-                            (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+                    (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
 
     # Add OCR text to the image
     for (bbox, text, prob) in ocr_results:
@@ -86,7 +95,8 @@ def process_image(uploaded_image):
         cv2.rectangle(image_np, top_left, bottom_right, (0, 0, 255), 2)  # Red for OCR
 
         # Display OCR text with a larger font size
-        cv2.putText(image_np, text, (top_left[0], top_left[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3)
+        cv2.putText(image_np, text, (top_left[0], top_left[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 1)
+
         ocr_info.append(f"Text: {text}")
 
     return image_np, barcode_info, ocr_info
