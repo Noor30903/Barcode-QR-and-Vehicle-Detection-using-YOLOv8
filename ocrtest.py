@@ -2,20 +2,18 @@ import os
 import json
 import logging
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score
 import easyocr
 import pytesseract
-# from paddleocr import PaddleOCR
 from transformers import TrOCRProcessor, VisionEncoderDecoderModel
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import torch
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # Initialize OCR models
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 easyocr_reader = easyocr.Reader(['en'], gpu=device == 'cuda')
-# paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en')
 trocr_processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-handwritten')
 trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-handwritten')
 
@@ -25,30 +23,55 @@ images_folder = r"ocr_dataset\images"
 output_folder = "ocr_comparison_results"
 os.makedirs(output_folder, exist_ok=True)
 
+def save_annotated_image(image_path, ocr_results, output_path):
+    """Draw bounding boxes and OCR text on the image and save it."""
+    image = Image.open(image_path).convert("RGB")
+    draw = ImageDraw.Draw(image)
+
+    # Load a larger font size for better visibility
+    font_path = r"C:\Windows\Fonts\arial.ttf"  # Adjust for your system
+    font = ImageFont.truetype(font_path, size=20)
+
+    for result in ocr_results:
+        bbox, text = result.get('bbox', None), result['text']
+        if bbox:
+            # Convert EasyOCR bounding box format [[x1, y1], [x2, y2], ...] to (x1, y1, x2, y2)
+            x1, y1 = bbox[0]
+            x2, y2 = bbox[2]
+            bbox_rect = [x1, y1, x2, y2]
+
+            # Draw bounding box
+            draw.rectangle(bbox_rect, outline="red", width=2)
+            # Draw larger text above the bounding box
+            draw.text((x1, y1 - 25), text, fill="blue", font=font)
+        else:
+            # For models without bounding boxes, draw the text in the top-left corner
+            draw.text((10, 10), f"Extracted: {text}", fill="blue", font=font)
+
+    image.save(output_path)
+
+
 def easyocr_ocr(image_path):
     """Perform OCR using EasyOCR."""
-    results = easyocr_reader.readtext(image_path, detail=0)
-    return ''.join(results).strip()
+    results = easyocr_reader.readtext(image_path)
+    return [{"bbox": result[0], "text": result[1]} for result in results]
 
 def tesseract_ocr(image_path):
     """Perform OCR using Tesseract."""
     image = Image.open(image_path)
-    return pytesseract.image_to_string(image).strip()
-
-# def paddleocr_ocr(image_path):
-#     """Perform OCR using PaddleOCR."""
-#     results = paddle_ocr.ocr(image_path, cls=True)
-#     return ' '.join([line[1][0] for line in results[0]]).strip()
+    text = pytesseract.image_to_string(image).strip()
+    return [{"bbox": None, "text": text}]  # Tesseract does not provide bounding boxes
 
 def trocr_ocr(image_path):
     """Perform OCR using TrOCR."""
     image = Image.open(image_path).convert("RGB")
     pixel_values = trocr_processor(images=image, return_tensors="pt").pixel_values
     generated_ids = trocr_model.generate(pixel_values)
-    return trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    text = trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+    return [{"bbox": None, "text": text}]  # TrOCR does not provide bounding boxes
 
-def evaluate_ocr(annotations_file, images_folder):
-    """Evaluate OCR models and compare their performance."""
+def evaluate_ocr_with_visualization(annotations_file, images_folder, output_folder):
+    """Evaluate OCR models, save annotated images, and compare their performance."""
     # Load annotations
     with open(annotations_file, 'r') as f:
         annotations = json.load(f)
@@ -56,11 +79,13 @@ def evaluate_ocr(annotations_file, images_folder):
     models = {
         "EasyOCR": easyocr_ocr,
         "Tesseract": tesseract_ocr,
-        # "PaddleOCR": paddleocr_ocr,
         "TrOCR": trocr_ocr
     }
 
     results = {model: {"exact_matches": 0, "character_matches": 0, "total_characters": 0} for model in models}
+
+    for model_name in models.keys():
+        os.makedirs(os.path.join(output_folder, model_name), exist_ok=True)
 
     for image_name, ground_truth_text in annotations.items():
         image_path = os.path.join(images_folder, image_name)
@@ -70,10 +95,19 @@ def evaluate_ocr(annotations_file, images_folder):
 
         for model_name, ocr_function in models.items():
             try:
-                detected_text = ocr_function(image_path)
+                ocr_results = ocr_function(image_path)
+
+                # Save annotated image
+                output_path = os.path.join(output_folder, model_name, image_name)
+                save_annotated_image(image_path, ocr_results, output_path)
+
+                # Extract OCR text for evaluation
+                detected_text = " ".join([result['text'] for result in ocr_results])
+                
                 # Exact Match Accuracy
                 if detected_text == ground_truth_text:
                     results[model_name]["exact_matches"] += 1
+                
                 # Character-Level Accuracy
                 total_chars = len(ground_truth_text)
                 correct_chars = sum(1 for a, b in zip(detected_text, ground_truth_text) if a == b)
@@ -125,7 +159,7 @@ def plot_ocr_comparison_with_values(metrics):
     plt.show()
 
 if __name__ == "__main__":
-    metrics = evaluate_ocr(annotations_file, images_folder)
+    metrics = evaluate_ocr_with_visualization(annotations_file, images_folder, output_folder)
     print("Evaluation Results:")
     for model_name, model_metrics in metrics.items():
         print(f"{model_name}:")
