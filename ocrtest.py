@@ -1,94 +1,133 @@
-import json
 import os
-from PIL import Image, ImageDraw, ImageFont
-import cv2
-import numpy as np
-import easyocr
-import torch
-from sklearn.metrics import precision_recall_fscore_support
+import json
+import logging
 import matplotlib.pyplot as plt
+from sklearn.metrics import accuracy_score
+import easyocr
+import pytesseract
+# from paddleocr import PaddleOCR
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from PIL import Image
+import torch
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Initialize EasyOCR Reader
-reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available())
+# Initialize OCR models
+pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+easyocr_reader = easyocr.Reader(['en'], gpu=device == 'cuda')
+# paddle_ocr = PaddleOCR(use_angle_cls=True, lang='en')
+trocr_processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-handwritten')
+trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-handwritten')
 
-# Load the COCO dataset
-with open(r'data\test_dataset\test\_annotations.coco.json', 'r') as f:
-    coco_data = json.load(f)
+# Paths
+annotations_file = r"ocr_dataset\annotations.json"
+images_folder = r"ocr_dataset\images"
+output_folder = "ocr_comparison_results"
+os.makedirs(output_folder, exist_ok=True)
 
-# Directory containing images
-image_dir = r"data\test_dataset\test"  # Update to actual image directory
-output_dir = "output_ocr_results"
+def easyocr_ocr(image_path):
+    """Perform OCR using EasyOCR."""
+    results = easyocr_reader.readtext(image_path, detail=0)
+    return ''.join(results).strip()
 
-os.makedirs(output_dir, exist_ok=True)
-
-# Evaluation Metrics Storage
-true_texts = []
-predicted_texts = []
-
-# Function to draw bounding boxes and save images
-def draw_and_save(image_path, annotations, ocr_results, output_path):
+def tesseract_ocr(image_path):
+    """Perform OCR using Tesseract."""
     image = Image.open(image_path)
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default()  # Use a better font if available
+    return pytesseract.image_to_string(image).strip()
 
-    # Draw ground truth bounding boxes and text
-    for ann in annotations:
-        bbox = ann["bbox"]
-        x, y, w, h = map(int, bbox)
-        draw.rectangle([(x, y), (x+w, y+h)], outline="blue", width=3)
-        draw.text((x, y - 10), "Ground Truth", fill="blue", font=font)
+# def paddleocr_ocr(image_path):
+#     """Perform OCR using PaddleOCR."""
+#     results = paddle_ocr.ocr(image_path, cls=True)
+#     return ' '.join([line[1][0] for line in results[0]]).strip()
 
-    # Draw OCR results
-    for (bbox, text, prob) in ocr_results:
-        (top_left, top_right, bottom_right, bottom_left) = bbox
-        top_left = tuple(map(int, top_left))
-        bottom_right = tuple(map(int, bottom_right))
-        draw.rectangle([top_left, bottom_right], outline="red", width=3)
-        draw.text(top_left, f"{text} ({prob:.2f})", fill="red", font=font)
+def trocr_ocr(image_path):
+    """Perform OCR using TrOCR."""
+    image = Image.open(image_path).convert("RGB")
+    pixel_values = trocr_processor(images=image, return_tensors="pt").pixel_values
+    generated_ids = trocr_model.generate(pixel_values)
+    return trocr_processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
-    # Save processed image
-    image.save(output_path)
+def evaluate_ocr(annotations_file, images_folder):
+    """Evaluate OCR models and compare their performance."""
+    # Load annotations
+    with open(annotations_file, 'r') as f:
+        annotations = json.load(f)
 
-# Process Images
-for image_info in coco_data["images"]:
-    image_path = os.path.join(image_dir, image_info["file_name"])
-    output_path = os.path.join(output_dir, image_info["file_name"])
-    annotations = [
-        ann for ann in coco_data["annotations"] if ann["image_id"] == image_info["id"]
-    ]
+    models = {
+        "EasyOCR": easyocr_ocr,
+        "Tesseract": tesseract_ocr,
+        # "PaddleOCR": paddleocr_ocr,
+        "TrOCR": trocr_ocr
+    }
 
-    if not os.path.exists(image_path):
-        print(f"Image {image_info['file_name']} not found. Skipping...")
-        continue
+    results = {model: {"exact_matches": 0, "character_matches": 0, "total_characters": 0} for model in models}
 
-    # Load the image
-    image_np = np.array(Image.open(image_path))
+    for image_name, ground_truth_text in annotations.items():
+        image_path = os.path.join(images_folder, image_name)
+        if not os.path.exists(image_path):
+            logging.warning(f"Image {image_name} not found.")
+            continue
 
-    # Perform OCR
-    ocr_results = reader.readtext(image_np)
+        for model_name, ocr_function in models.items():
+            try:
+                detected_text = ocr_function(image_path)
+                # Exact Match Accuracy
+                if detected_text == ground_truth_text:
+                    results[model_name]["exact_matches"] += 1
+                # Character-Level Accuracy
+                total_chars = len(ground_truth_text)
+                correct_chars = sum(1 for a, b in zip(detected_text, ground_truth_text) if a == b)
+                results[model_name]["character_matches"] += correct_chars
+                results[model_name]["total_characters"] += total_chars
+            except Exception as e:
+                logging.error(f"Error with {model_name} on {image_name}: {e}")
 
-    # Collect ground truth and predictions for evaluation
-    for ann in annotations:
-        true_texts.append("Ground Truth Text")  # Replace with actual ground truth text if available
-    for (_, text, _) in ocr_results:
-        predicted_texts.append(text)
+    # Calculate metrics
+    metrics = {
+        model_name: {
+            "exact_match_accuracy": result["exact_matches"] / len(annotations) if len(annotations) > 0 else 0,
+            "character_accuracy": result["character_matches"] / result["total_characters"] if result["total_characters"] > 0 else 0
+        }
+        for model_name, result in results.items()
+    }
 
-    # Draw bounding boxes and save processed images
-    draw_and_save(image_path, annotations, ocr_results, output_path)
-    print(f"Processed and saved {image_info['file_name']}")
+    # Plot results
+    plot_ocr_comparison_with_values(metrics)
+    return metrics
 
-# Evaluate Metrics
-precision, recall, f1, _ = precision_recall_fscore_support(
-    true_texts, predicted_texts, average="weighted"
-)
+def plot_ocr_comparison_with_values(metrics):
+    """Plot OCR performance comparison with actual values annotated."""
+    models = metrics.keys()
+    exact_match_acc = [metrics[model]["exact_match_accuracy"] for model in models]
+    char_acc = [metrics[model]["character_accuracy"] for model in models]
 
-# Display Metrics
-print(f"Precision: {precision:.2f}, Recall: {recall:.2f}, F1 Score: {f1:.2f}")
+    x = range(len(models))  # X-axis positions for each model
 
-# Visualize Metrics
-metrics = {"Precision": precision, "Recall": recall, "F1 Score": f1}
-plt.bar(metrics.keys(), metrics.values())
-plt.title("OCR Evaluation Metrics")
-plt.ylabel("Score")
-plt.ylim(0, 1)
-plt.show()
+    # Plot Exact Match Accuracy
+    plt.figure(figsize=(10, 6))
+    bar1 = plt.bar(x, exact_match_acc, color='blue', alpha=0.7, label='Exact Match Accuracy')
+    bar2 = plt.bar(x, char_acc, color='green', alpha=0.7, label='Character-Level Accuracy', bottom=exact_match_acc)
+
+    # Annotate bars with values
+    for i, bar in enumerate(bar1):
+        plt.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height() / 2, f"{exact_match_acc[i]:.2f}", ha='center', va='center', color='white', fontsize=10)
+    for i, bar in enumerate(bar2):
+        plt.text(bar.get_x() + bar.get_width() / 2.0, bar.get_height() + exact_match_acc[i] / 2, f"{char_acc[i]:.2f}", ha='center', va='center', color='white', fontsize=10)
+
+    # X-axis and labels
+    plt.xticks(x, models)
+    plt.xlabel("OCR Models")
+    plt.ylabel("Accuracy")
+    plt.title("OCR Model Comparison with Actual Values")
+    plt.legend()
+
+    # Show the plot
+    plt.show()
+
+if __name__ == "__main__":
+    metrics = evaluate_ocr(annotations_file, images_folder)
+    print("Evaluation Results:")
+    for model_name, model_metrics in metrics.items():
+        print(f"{model_name}:")
+        print(f"  Exact Match Accuracy: {model_metrics['exact_match_accuracy']:.2f}")
+        print(f"  Character-Level Accuracy: {model_metrics['character_accuracy']:.2f}")
